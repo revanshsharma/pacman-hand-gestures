@@ -1,0 +1,379 @@
+// Gesture controls for Pac-Man
+// Tries to use MediaPipe Hands (cdn) if available; falls back to on-screen buttons.
+
+let webcamEl = null;
+let toggleBtn = null;
+let fallbackEl = null;
+let statusEl = null;
+let gesturesEnabled = false;
+let stream = null;
+let hands = null;
+let lastDetected = null;
+let detectionCooldown = 300; // ms between detections
+let lastDetectionTime = 0;
+let motionInterval = null;
+let prevFrame = null;
+let motionCanvas = null;
+let motionCtx = null;
+let overlayCanvas = null;
+let overlayCtx = null;
+
+function setStatus(text) {
+    if (statusEl) statusEl.textContent = text;
+}
+
+// Simple direction callback — resolves to Pac-Man API
+function onDirection(dir) {
+    console.log('onDirection called:', dir);
+    if (!window.pacman) return;
+    window.pacman.updateDirection(dir);
+}
+
+// Fallback button wiring
+function enableFallbackButtons() {
+    if (!fallbackEl) return;
+    fallbackEl.style.display = '';
+    const up = document.getElementById('btn-up');
+    const left = document.getElementById('btn-left');
+    const down = document.getElementById('btn-down');
+    const right = document.getElementById('btn-right');
+    if (up) up.addEventListener('click', () => onDirection('U'));
+    if (left) left.addEventListener('click', () => onDirection('L'));
+    if (down) down.addEventListener('click', () => onDirection('D'));
+    if (right) right.addEventListener('click', () => onDirection('R'));
+}
+
+async function startWebcam() {
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({video: {width: 640, height: 480}});
+        webcamEl.srcObject = stream;
+        webcamEl.style.display = '';
+        return true;
+    } catch (e) {
+        console.warn('Webcam denied or unavailable:', e);
+        setStatus('Webcam unavailable — using fallback buttons');
+        return false;
+    }
+}
+
+function stopWebcam() {
+    if (stream) {
+        for (const t of stream.getTracks()) t.stop();
+        stream = null;
+    }
+    webcamEl.style.display = 'none';
+}
+
+// Very small, conservative direction detection using wrist vs index mcp landmarks
+function detectDirectionFromLandmarks(landmarks) {
+    // landmarks is array of {x,y,z} normalized to video
+    // We'll look at wrist (0) and index_finger_mcp (5) and middle_finger_mcp (9)
+    const wrist = landmarks[0];
+    const indexMCP = landmarks[5];
+    const middleMCP = landmarks[9];
+
+    const dx = indexMCP.x - wrist.x;
+    const dy = indexMCP.y - wrist.y;
+
+    // threshold tuned for normalized coords
+    if (Math.abs(dx) > Math.abs(dy)) {
+        if (dx > 0.15) return 'R';
+        if (dx < -0.15) return 'L';
+    } else {
+        if (dy > 0.12) return 'D';
+        if (dy < -0.12) return 'U';
+    }
+    return null;
+}
+
+// Simple pose detection: thumbs up/down, open hand, fist
+function detectPose(landmarks) {
+    if (!landmarks || landmarks.length < 21) return null;
+    const isExtended = (tip, pip) => landmarks[tip].y < landmarks[pip].y;
+    const indexExt = isExtended(8,6);
+    const middleExt = isExtended(12,10);
+    const ringExt = isExtended(16,14);
+    const pinkyExt = isExtended(20,18);
+    const thumbUp = landmarks[4].y < landmarks[2].y - 0.02; // slightly above
+    const thumbDown = landmarks[4].y > landmarks[2].y + 0.02;
+
+    // thumbs up / down: thumb extended and other fingers folded
+    if (thumbUp && !indexExt && !middleExt && !ringExt && !pinkyExt) return 'thumbs_up';
+    if (thumbDown && !indexExt && !middleExt && !ringExt && !pinkyExt) return 'thumbs_down';
+
+    // open hand: most fingers extended
+    const extendedCount = [indexExt, middleExt, ringExt, pinkyExt].filter(Boolean).length;
+    if (extendedCount >= 3) return 'open';
+
+    // fist: no fingers extended
+    if (extendedCount === 0) return 'fist';
+
+    return null;
+}
+
+async function initMediaPipeHands() {
+    setStatus('Loading MediaPipe...');
+    try {
+        // dynamic import of MediaPipe Hands (cdn)
+        // Using the official bundle URL. If offline, this will throw.
+        await import('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
+        await import('https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js');
+        await import('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
+
+        const {Hands} = window;
+        hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 0,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onHandsResults);
+
+        const camera = new window.Camera(webcamEl, {
+            onFrame: async () => {
+                await hands.send({image: webcamEl});
+            },
+            width: 640,
+            height: 480
+        });
+        camera.start();
+
+        setStatus('MediaPipe running');
+        return true;
+    } catch (e) {
+        console.warn('MediaPipe load failed:', e);
+        // Try loading via script tags as a fallback (some browsers don't support dynamic import of these bundles)
+        console.log('Attempting script-tag fallback for MediaPipe...');
+        try {
+            await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
+            await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js');
+            await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
+            if (window.Hands) {
+                const {Hands} = window;
+                hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+                hands.setOptions({maxNumHands:1, modelComplexity:0, minDetectionConfidence:0.7, minTrackingConfidence:0.5});
+                hands.onResults(onHandsResults);
+                const camera = new window.Camera(webcamEl, {onFrame: async ()=>{await hands.send({image: webcamEl});}, width:640, height:480});
+                camera.start();
+                setStatus('MediaPipe running (script tag)');
+                return true;
+            }
+        } catch (e2) {
+            console.warn('Script-tag fallback failed:', e2);
+        }
+
+        setStatus('MediaPipe unavailable — using motion fallback or buttons');
+        return false;
+    }
+}
+
+// helper to load external scripts dynamically
+function loadScript(src) {
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.async = true;
+        s.onload = () => resolve();
+        s.onerror = (e) => reject(e);
+        document.head.appendChild(s);
+    });
+}
+
+// Motion-based fallback: compute simple frame-diff centroid and detect directions
+function startMotionFallback() {
+    if (!webcamEl) return;
+    if (!motionCanvas) {
+        motionCanvas = document.createElement('canvas');
+        motionCanvas.width = 160;
+        motionCanvas.height = 120;
+        motionCtx = motionCanvas.getContext('2d');
+    }
+    prevFrame = null;
+    if (motionInterval) clearInterval(motionInterval);
+    motionInterval = setInterval(() => {
+        try {
+            motionCtx.drawImage(webcamEl, 0, 0, motionCanvas.width, motionCanvas.height);
+            const img = motionCtx.getImageData(0,0,motionCanvas.width,motionCanvas.height);
+            const data = img.data;
+            let sumX=0,sumY=0,count=0;
+            if (prevFrame) {
+                for (let i=0;i<data.length;i+=4) {
+                    const diff = Math.abs(data[i]-prevFrame[i]) + Math.abs(data[i+1]-prevFrame[i+1]) + Math.abs(data[i+2]-prevFrame[i+2]);
+                    if (diff>60) {
+                        const px = ((i/4) % motionCanvas.width);
+                        const py = Math.floor((i/4)/motionCanvas.width);
+                        sumX += px; sumY += py; count++;
+                    }
+                }
+                if (count>50) {
+                    const cx = sumX/count; const cy = sumY/count;
+                    // compare to center
+                    const dx = cx - motionCanvas.width/2;
+                    const dy = cy - motionCanvas.height/2;
+                    const now = performance.now();
+                    if (now - lastDetectionTime > detectionCooldown) {
+                        if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 20) {
+                            onDirection(dx>0 ? 'R' : 'L');
+                            setStatus('Motion detected: ' + (dx>0?'R':'L'));
+                            lastDetectionTime = now;
+                            // draw centroid on overlay if available
+                            if (overlayCtx) {
+                                overlayCtx.clearRect(0,0,overlayCanvas.width, overlayCanvas.height);
+                                overlayCtx.fillStyle = 'rgba(255,0,0,0.6)';
+                                overlayCtx.beginPath();
+                                // scale centroid to overlay size
+                                const sx = cx / motionCanvas.width * overlayCanvas.width;
+                                const sy = cy / motionCanvas.height * overlayCanvas.height;
+                                overlayCtx.arc(sx, sy, 8, 0, Math.PI*2);
+                                overlayCtx.fill();
+                            }
+                        } else if (Math.abs(dy) > 20) {
+                            onDirection(dy>0 ? 'D' : 'U');
+                            setStatus('Motion detected: ' + (dy>0?'D':'U'));
+                            lastDetectionTime = now;
+                            if (overlayCtx) {
+                                overlayCtx.clearRect(0,0,overlayCanvas.width, overlayCanvas.height);
+                                overlayCtx.fillStyle = 'rgba(255,0,0,0.6)';
+                                overlayCtx.beginPath();
+                                const sx = cx / motionCanvas.width * overlayCanvas.width;
+                                const sy = cy / motionCanvas.height * overlayCanvas.height;
+                                overlayCtx.arc(sx, sy, 8, 0, Math.PI*2);
+                                overlayCtx.fill();
+                            }
+                        }
+                    }
+                }
+            }
+            prevFrame = new Uint8ClampedArray(data);
+        } catch (e) {
+            console.warn('Motion fallback error', e);
+        }
+    }, 150);
+}
+
+function stopMotionFallback() {
+    if (motionInterval) { clearInterval(motionInterval); motionInterval = null; }
+}
+
+function onHandsResults(results) {
+    console.log('onHandsResults called, hands count:', (results.multiHandLandmarks||[]).length);
+    if (!results.multiHandLandmarks || !results.multiHandLandmarks.length) {
+        // clear overlay
+        if (overlayCtx) overlayCtx.clearRect(0,0,overlayCanvas.width, overlayCanvas.height);
+        return;
+    }
+    const now = performance.now();
+    if (now - lastDetectionTime < detectionCooldown) return;
+
+    const landmarks = results.multiHandLandmarks[0];
+    const dir = detectDirectionFromLandmarks(landmarks);
+    const pose = detectPose(landmarks);
+    if (pose) console.log('pose detected:', pose);
+    // map poses to directions: open -> R, fist -> L, thumbs_up -> U, thumbs_down -> D
+    if (pose === 'open') dir = 'R';
+    else if (pose === 'fist') dir = 'L';
+    else if (pose === 'thumbs_up') dir = 'U';
+    else if (pose === 'thumbs_down') dir = 'D';
+    if (dir && dir !== lastDetected) {
+        lastDetected = dir;
+        lastDetectionTime = now;
+        onDirection(dir);
+        setStatus('Detected: ' + dir);
+    }
+    // draw landmarks to overlay if available
+    if (overlayCtx) {
+        overlayCtx.clearRect(0,0,overlayCanvas.width, overlayCanvas.height);
+        const landmarks = results.multiHandLandmarks[0];
+        overlayCtx.strokeStyle = 'lime';
+        overlayCtx.fillStyle = 'rgba(0,255,0,0.8)';
+        for (const lm of landmarks) {
+            const x = lm.x * overlayCanvas.width;
+            const y = lm.y * overlayCanvas.height;
+            overlayCtx.beginPath();
+            overlayCtx.arc(x,y,4,0,Math.PI*2);
+            overlayCtx.fill();
+        }
+        // draw pose label
+        if (pose) {
+            overlayCtx.fillStyle = 'white';
+            overlayCtx.font = '12px sans-serif';
+            overlayCtx.fillText(pose, 6, 14);
+        }
+    }
+}
+
+async function enableGestures() {
+    if (gesturesEnabled) return;
+    gesturesEnabled = true;
+    setStatus('Starting webcam...');
+    const ok = await startWebcam();
+    if (!ok) {
+        enableFallbackButtons();
+        return;
+    }
+    const mpOk = await initMediaPipeHands();
+    if (!mpOk) {
+        // we have webcam but not mediapipe — still show buttons
+        enableFallbackButtons();
+        // start motion-based detection as a fallback
+        startMotionFallback();
+    }
+}
+
+function disableGestures() {
+    gesturesEnabled = false;
+    stopWebcam();
+    stopMotionFallback();
+    setStatus('Gesture controls disabled');
+}
+
+// Initialize UI bindings once DOM is ready
+function initUI() {
+    webcamEl = document.getElementById('webcam');
+    toggleBtn = document.getElementById('toggle-gestures');
+    fallbackEl = document.getElementById('gesture-fallback');
+    statusEl = document.getElementById('gesture-status');
+
+    // create an overlay canvas to draw landmarks/centroid for debugging
+    if (!overlayCanvas) {
+        overlayCanvas = document.createElement('canvas');
+        overlayCanvas.width = 160;
+        overlayCanvas.height = 120;
+        overlayCanvas.style.position = 'fixed';
+        overlayCanvas.style.right = '10px';
+        overlayCanvas.style.bottom = '10px';
+        overlayCanvas.style.width = '160px';
+        overlayCanvas.style.height = '120px';
+        overlayCanvas.style.zIndex = 1001;
+        overlayCanvas.style.pointerEvents = 'none';
+        document.body.appendChild(overlayCanvas);
+        overlayCtx = overlayCanvas.getContext('2d');
+    }
+
+    if (toggleBtn) {
+        toggleBtn.addEventListener('click', async () => {
+            if (!gesturesEnabled) {
+                await enableGestures();
+                toggleBtn.textContent = 'Disable Gesture Controls';
+            } else {
+                disableGestures();
+                toggleBtn.textContent = 'Enable Gesture Controls';
+            }
+        });
+    }
+
+    // enable fallback by default (so users on desktops can test)
+    enableFallbackButtons();
+    setStatus('Gesture ready');
+
+    // expose for debugging
+    window._gesture = {enableGestures, disableGestures};
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initUI);
+} else {
+    initUI();
+}

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Pac-Man</title>
+        <link rel="stylesheet" href="pacman.css">
+            <script src="pacman.js"></script>
+            <!-- Gesture support: MediaPipe Hands + fingerpose (loaded by gestures.js) -->
+            <script src="gestures.js"></script>
+    </head>
+    <body>
+            <canvas id="board"></canvas>
+
+            <!-- Webcam preview for gesture controls (kept hidden by default) -->
+            <video id="webcam" autoplay playsinline style="position:fixed;right:10px;bottom:10px;width:160px;height:120px;display:none;border:2px solid #444;z-index:1000"></video>
+
+            <!-- Gesture control toggle and fallback buttons -->
+            <div id="gesture-ui" style="position:fixed;left:10px;bottom:10px;z-index:1000;">
+                <button id="toggle-gestures">Enable Gesture Controls</button>
+                <div id="gesture-fallback" style="margin-top:8px;display:none;">
+                    <button id="btn-up">↑</button>
+                    <button id="btn-left">←</button>
+                    <button id="btn-down">↓</button>
+                    <button id="btn-right">→</button>
+                </div>
+                <div id="gesture-status" style="color:#fff;margin-top:6px;font-size:12px"></div>
+                <div style="margin-top:8px;color:#fff;font-size:12px">Sound: <input id="volume-slider" type="range" min="0" max="1" step="0.01" value="0.8" style="vertical-align:middle"></div>
+                <div style="margin-top:6px;color:#ddd;font-size:11px">Tip: for webcam, serve over http://localhost</div>
+            </div>
+    </body>
+</html>
